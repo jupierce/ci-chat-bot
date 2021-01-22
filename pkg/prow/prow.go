@@ -55,6 +55,9 @@ func JobForConfig(prowConfigLoader ProwConfigLoader, jobName string) (*prowapiv1
 
 	pj := &prowapiv1.ProwJob{
 		TypeMeta: metav1.TypeMeta{APIVersion: "prow.k8s.io/v1", Kind: "ProwJob"},
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: periodicConfig.Annotations,
+		},
 		Spec:     *spec,
 		Status: prowapiv1.ProwJobStatus{
 			StartTime: metav1.Now(),

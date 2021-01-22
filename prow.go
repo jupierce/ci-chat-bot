@@ -50,7 +50,7 @@ var supportedUpgradeTests = []string{"e2e-upgrade", "e2e-upgrade-all", "e2e-upgr
 
 // supportedPlatforms requires a job within the release periodics that can launch a
 // cluster that has the label job-env: platform-name.
-var supportedPlatforms = []string{"aws", "gcp", "azure", "vsphere", "metal"}
+var supportedPlatforms = []string{"aws", "gcp", "azure", "vsphere", "metal", "osd-aws"}
 
 // supportedParameters are the allowed parameter keys that can be passed to jobs
 var supportedParameters = []string{"ovn", "proxy", "compact", "fips", "mirror", "shared-vpc", "large", "xlarge", "ipv6", "preserve-bootstrap", "test", "rt", "single-node"}
@@ -134,8 +134,21 @@ func (r *URLConfigResolver) Resolve(org, repo, branch, variant string) ([]byte, 
 // cluster. If this method returns nil, it is safe to consider the cluster released.
 func (m *jobManager) stopJob(name string) error {
 	namespace := fmt.Sprintf("ci-ln-%s", namespaceSafeHash(name))
-	if err := m.projectClient.ProjectV1().Projects().Delete(context.TODO(), namespace, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
-		return err
+	if _, err := m.coreClient.CoreV1().Pods(namespace).Get(context.TODO(), "launch", metav1.GetOptions{}); errors.IsNotFound(err) {
+		// If launch Pod does not exist (defined in legacy template based method), this is a step based test implementation.
+		// We need to terminate the workload and let post steps complete gracefully for successful cleanup.
+		// The "wait" step in the launch step must be terminated.
+		_, err := commandContents(m.coreClient.CoreV1(), m.coreConfig, namespace, "launch-wait", "test", []string{"pkill", "-9", "-P", "1"})
+		if err != nil && errors.IsNotFound(err) {
+			klog.Infof("Unable to cleanly terminate workload in %s: %v", namespace, err)
+			return err
+		}
+	} else {
+		// If launch-wait does not exist, then assume this is a template based deployment. Deleting the
+		// project will trigger the teardown container.
+		if err := m.projectClient.ProjectV1().Projects().Delete(context.TODO(), namespace, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
 	}
 	return nil
 }
@@ -166,23 +179,30 @@ func (m *jobManager) newJob(job *Job) error {
 		return err
 	}
 
+	annotations := map[string]string{
+		"ci-chat-bot.openshift.io/originalMessage": job.OriginalMessage,
+		"ci-chat-bot.openshift.io/mode":            job.Mode,
+		"ci-chat-bot.openshift.io/jobParams":       paramsToString(job.JobParams),
+		"ci-chat-bot.openshift.io/user":            job.RequestedBy,
+		"ci-chat-bot.openshift.io/channel":         job.RequestedChannel,
+		"ci-chat-bot.openshift.io/ns":              namespace,
+		"ci-chat-bot.openshift.io/platform":        job.Platform,
+		"ci-chat-bot.openshift.io/jobInputs":       string(jobInputData),
+
+		"prow.k8s.io/job": pj.Spec.Job,
+
+		"release.openshift.io/architecture": job.Architecture,
+	}
+
+	// Propagate any annotations set in the periodic definition
+	for k, v := range pj.Annotations {
+		annotations[k] = v
+	}
+
 	pj.ObjectMeta = metav1.ObjectMeta{
 		Name:      job.Name,
 		Namespace: m.prowNamespace,
-		Annotations: map[string]string{
-			"ci-chat-bot.openshift.io/originalMessage": job.OriginalMessage,
-			"ci-chat-bot.openshift.io/mode":            job.Mode,
-			"ci-chat-bot.openshift.io/jobParams":       paramsToString(job.JobParams),
-			"ci-chat-bot.openshift.io/user":            job.RequestedBy,
-			"ci-chat-bot.openshift.io/channel":         job.RequestedChannel,
-			"ci-chat-bot.openshift.io/ns":              namespace,
-			"ci-chat-bot.openshift.io/platform":        job.Platform,
-			"ci-chat-bot.openshift.io/jobInputs":       string(jobInputData),
-
-			"prow.k8s.io/job": pj.Spec.Job,
-
-			"release.openshift.io/architecture": job.Architecture,
-		},
+		Annotations: annotations,
 		Labels: map[string]string{
 			"ci-chat-bot.openshift.io/launch": "true",
 
@@ -222,6 +242,9 @@ func (m *jobManager) newJob(job *Job) error {
 		if len(input.Version) == 0 {
 			continue
 		}
+		// OSD needs to resolve the pullspec directly from cluster version, so include it
+		// in the env vars.
+		prow.SetJobEnvVar(&pj.Spec, "CLUSTER_VERSION", input.Version)
 		if m := reVersion.FindStringSubmatch(input.Version); m != nil {
 			targetRelease = m[1]
 		}
@@ -515,17 +538,33 @@ func (m *jobManager) waitForJob(job *Job) error {
 		return nil
 	}
 
-	var targetPodName string
+	var installPodName string
+	var installPodContainerName string
+	var workloadPodName string
+	var workloadContainerName string
 	switch job.Mode {
 	case JobTypeBuild:
 	default:
-		targetPodName, err = findTargetName(pj.Spec.PodSpec)
+		targetName, err := findTargetName(pj.Spec.PodSpec)
 		if err != nil {
 			if klog.V(2) {
 				data, _ := json.MarshalIndent(pj.Spec.PodSpec, "", "  ")
 				klog.Infof("Could not find --target in:\n%s", string(data))
 			}
 			return err
+		}
+
+		if _, ok := pj.Annotations["job-impl.install-step"]; ok {
+			installPodName = fmt.Sprintf("%s-%s", targetName, pj.Annotations["job-impl.install-step"])
+			installPodContainerName = "test"
+			workloadPodName = "launch-wait"
+			workloadContainerName = "test"
+		} else {
+			// Original template based method used 'launch' pod for both setup and workload
+			installPodName = targetName
+			workloadPodName = installPodName
+			installPodContainerName = "setup"
+			workloadContainerName = "test"
 		}
 	}
 
@@ -557,39 +596,73 @@ func (m *jobManager) waitForJob(job *Job) error {
 		return fmt.Errorf("unable to check launch status: %v", err)
 	}
 
-	klog.Infof("Job %q waiting for setup container in pod %s/%s to complete", job.Name, namespace, targetPodName)
+	klog.Infof("Job %q monitoring %s for installation in container %s/%s to complete and for test to start in %s/%s",
+		job.Name, namespace, installPodName, installPodContainerName, workloadPodName, workloadContainerName)
 
-	seen = false
+	installSeen := false
+	workloadSeen := false
 	var lastErr error
+	var installPod, workloadPod *corev1.Pod
 	err = wait.PollImmediate(15*time.Second, 60*time.Minute, func() (bool, error) {
 		if m.jobIsComplete(job) {
+			if installSeen {
+				// For step based jobs, we need to terminate the installation gracefully for the post jobs to clean up.
+				_, err := commandContents(m.coreClient.CoreV1(), m.coreConfig, namespace, installPodName, installPodContainerName, []string{"pkill", "-9", "-P", "1"})
+				if err != nil {
+					klog.Infof("Job %q complete but unable to terminate installation %s: %v", job.Name, namespace, err)
+				}
+			}
 			return false, errJobCompleted
 		}
-		pod, err := m.coreClient.CoreV1().Pods(namespace).Get(context.TODO(), targetPodName, metav1.GetOptions{})
+		installPod, err = m.coreClient.CoreV1().Pods(namespace).Get(context.TODO(), installPodName, metav1.GetOptions{})
 		if err != nil {
 			// pod could not be created or we may not have permission yet
 			if !errors.IsNotFound(err) && !errors.IsForbidden(err) {
 				lastErr = err
 				return false, err
 			}
-			if seen {
+			if installSeen {
 				return false, fmt.Errorf("cluster has already been torn down")
 			}
 			return false, nil
 		}
-		seen = true
-		if pod.DeletionTimestamp != nil {
-			return false, fmt.Errorf("cluster is being torn down")
+		installSeen = true
+
+		if installPodName == workloadPodName {
+			workloadPod = installPod
+			workloadSeen = installSeen
+		} else {
+			// If the installPod and workloadPod are separate, wait for the workload to start.
+			workloadPod, err = m.coreClient.CoreV1().Pods(namespace).Get(context.TODO(), workloadPodName, metav1.GetOptions{})
+			if err != nil {
+				// pod could not be created or we may not have permission yet
+				if !errors.IsNotFound(err) && !errors.IsForbidden(err) {
+					lastErr = err
+					return false, err
+				}
+				if workloadSeen {
+					return false, fmt.Errorf("workload pod inaccessible; cluster has already been torn down")
+				}
+				return false, nil
+			}
+			workloadSeen = true
 		}
-		if pod.Status.Phase == "Succeeded" || pod.Status.Phase == "Failed" {
-			return false, fmt.Errorf("cluster has already been torn down")
+
+		if workloadPod.DeletionTimestamp != nil {
+			return false, fmt.Errorf("workload deletion; cluster will be torn down")
 		}
-		ok, err := containerSuccessful(pod, "setup")
+
+		if workloadPod.Status.Phase == "Succeeded" || workloadPod.Status.Phase == "Failed" {
+			return false, fmt.Errorf("workload ended; cluster will be torn down")
+		}
+
+		ok, err := containerSuccessful(installPod, installPodContainerName)
 		if err != nil {
 			return false, err
 		}
-		if containerTerminated(pod, "test") {
-			return false, fmt.Errorf("cluster is shutting down")
+
+		if containerTerminated(workloadPod, workloadContainerName) {
+			return false, fmt.Errorf("workload terminated; cluster is shutting down")
 		}
 		return ok, nil
 	})
@@ -603,32 +676,32 @@ func (m *jobManager) waitForJob(job *Job) error {
 		return fmt.Errorf("pod never became available: %v", err)
 	}
 
-	klog.Infof("Job %q waiting for kubeconfig from pod %s/%s", job.Name, namespace, targetPodName)
+	klog.Infof("Job %q waiting for kubeconfig from %s pod %s/%s", job.Name, namespace, workloadPodName, workloadContainerName)
 
 	var kubeconfig string
 	err = wait.PollImmediate(30*time.Second, 10*time.Minute, func() (bool, error) {
 		if m.jobIsComplete(job) {
 			return false, errJobCompleted
 		}
-		contents, err := commandContents(m.coreClient.CoreV1(), m.coreConfig, namespace, targetPodName, "test", []string{"cat", "/tmp/admin.kubeconfig"})
+		contents, err := commandContents(m.coreClient.CoreV1(), m.coreConfig, namespace, workloadPodName, workloadContainerName, []string{"cat", "/tmp/admin.kubeconfig"})
 		if err != nil {
 			if strings.Contains(err.Error(), "container not found") {
 				// periodically check whether the still exists and is not succeeded or failed
-				pod, err := m.coreClient.CoreV1().Pods(namespace).Get(context.TODO(), targetPodName, metav1.GetOptions{})
+				pod, err := m.coreClient.CoreV1().Pods(namespace).Get(context.TODO(), workloadPodName, metav1.GetOptions{})
 				if errors.IsNotFound(err) || (pod != nil && (pod.Status.Phase == "Succeeded" || pod.Status.Phase == "Failed")) {
 					return false, fmt.Errorf("pod cannot be found or has been deleted, assume cluster won't come up")
 				}
 
 				return false, nil
 			}
-			klog.Infof("Unable to retrieve config contents for %s/%s: %v", namespace, targetPodName, err)
+			klog.Infof("Unable to retrieve config contents for %s %s/%s: %v", namespace, workloadPodName, workloadContainerName, err)
 			return false, nil
 		}
 		kubeconfig = contents
 		return len(contents) > 0, nil
 	})
 	if err != nil {
-		return fmt.Errorf("could not retrieve kubeconfig from pod %s/%s: %v", namespace, targetPodName, err)
+		return fmt.Errorf("could not retrieve kubeconfig from pod %s %s/%s: %v", namespace, workloadPodName, workloadContainerName, err)
 	}
 
 	job.Credentials = kubeconfig
@@ -637,19 +710,35 @@ func (m *jobManager) waitForJob(job *Job) error {
 	// TODO: better criteria?
 	var waitErr error
 	if err := waitForClusterReachable(kubeconfig, func() bool { return m.jobIsComplete(job) }); err != nil {
-		klog.Infof("error: Job %q unable to wait for the cluster %s/%s to start: %v", job.Name, namespace, targetPodName, err)
+		klog.Infof("error: Job %q unable to wait for the cluster %s %/s%s to start: %v", job.Name, namespace, workloadPodName, workloadContainerName, err)
 		job.Credentials = ""
 		waitErr = fmt.Errorf("cluster did not become reachable: %v", err)
 	}
 
-	lines := int64(2)
-	logs, err := m.coreClient.CoreV1().Pods(namespace).GetLogs(targetPodName, &corev1.PodLogOptions{Container: "setup", TailLines: &lines}).DoRaw(context.TODO())
+	// Step registry methods should store this value in SHARED_DIR; check there first
+	consoleURL, err := commandContents(m.coreClient.CoreV1(), m.coreConfig, namespace, workloadPodName, workloadContainerName, []string{"cat", "/tmp/secret/console.url"})
 	if err != nil {
-		klog.Infof("error: Job %q unable to get setup logs: %v", job.Name, err)
+		// Otherwise, search for it in the installation pod logs
+		lines := int64(2)
+		logs, err := m.coreClient.CoreV1().Pods(namespace).GetLogs(installPodName, &corev1.PodLogOptions{Container: installPodContainerName, TailLines: &lines}).DoRaw(context.TODO())
+		if err == nil {
+			consoleURL = strings.TrimSpace(reFixLines.ReplaceAllString(string(logs), "$1"))
+		} else {
+			klog.Infof("error: Job %q unable to get setup logs: %v", job.Name, err)
+		}
 	}
-	job.PasswordSnippet = strings.TrimSpace(reFixLines.ReplaceAllString(string(logs), "$1"))
+	if err != nil {
+		job.PasswordSnippet = fmt.Sprintf("Unable to retieve console URL: %v", err)
+	} else {
+		job.PasswordSnippet = consoleURL
+	}
 
-	password, err := commandContents(m.coreClient.CoreV1(), m.coreConfig, namespace, targetPodName, "test", []string{"cat", "/tmp/artifacts/installer/auth/kubeadmin-password"})
+	// Check new step registry secret location
+	password, err := commandContents(m.coreClient.CoreV1(), m.coreConfig, namespace, workloadPodName, workloadContainerName, []string{"cat", "/tmp/secret/kubeadmin-password"})
+	if err != nil {
+		// Check legacy template location
+		password, err = commandContents(m.coreClient.CoreV1(), m.coreConfig, namespace, installPodName, "test", []string{"cat", "/tmp/artifacts/installer/auth/kubeadmin-password"})
+	}
 	if err != nil {
 		klog.Infof("error: Job %q unable to get kubeadmin password: %v", job.Name, err)
 		job.PasswordSnippet = fmt.Sprintf("\nError: Unable to retrieve kubeadmin password, you must use the kubeconfig file to access the cluster: %v", err)
