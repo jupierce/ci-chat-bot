@@ -50,7 +50,7 @@ var supportedUpgradeTests = []string{"e2e-upgrade", "e2e-upgrade-all", "e2e-upgr
 
 // supportedPlatforms requires a job within the release periodics that can launch a
 // cluster that has the label job-env: platform-name.
-var supportedPlatforms = []string{"aws", "gcp", "azure", "vsphere", "metal"}
+var supportedPlatforms = []string{"aws", "osd", "gcp", "azure", "vsphere", "metal"}
 
 // supportedParameters are the allowed parameter keys that can be passed to jobs
 var supportedParameters = []string{"ovn", "proxy", "compact", "fips", "mirror", "shared-vpc", "large", "xlarge", "ipv6", "preserve-bootstrap", "test", "rt", "single-node"}
@@ -209,7 +209,7 @@ func (m *jobManager) newJob(job *Job) error {
 			"release.openshift.io/architecture": job.Architecture,
 		},
 		Labels: map[string]string{
-			"ci-chat-bot.openshift.io/launch": "true",
+			"ci-chat-bot-alpha.openshift.io/launch": "true",
 
 			"prow.k8s.io/type": string(pj.Spec.Type),
 			"prow.k8s.io/job":  pj.Spec.Job,
@@ -247,6 +247,9 @@ func (m *jobManager) newJob(job *Job) error {
 		if len(input.Version) == 0 {
 			continue
 		}
+		// OSD needs to resolve the pullspec itself from cluster version, so include it
+		// in the env vars.
+		prow.SetJobEnvVar(&pj.Spec, "CLUSTER_VERSION", input.Version)
 		if m := reVersion.FindStringSubmatch(input.Version); m != nil {
 			targetRelease = m[1]
 		}
